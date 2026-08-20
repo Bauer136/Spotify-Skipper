@@ -1,0 +1,39 @@
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- Virtualenv -------------------------------------------------------------
+.venv/
+
+# --- Secrets & auth state (never commit) ------------------------------------
+.env
+.spotify_token_cache
+token.json
+
+# --- Model assets: 7.5 MB, re-downloadable (BUILD_GUIDE 3.1) ----------------
+# Also covers models/pose_clf.joblib from the Phase 6 training path.
+models/*
+!models/.gitkeep
+
+# --- Recorded landmark clips (Phase 5) --------------------------------------
+data/*
+!data/.gitkeep
+
+# --- Runtime logs, incl. the logs/.lock single-instance guard ---------------
+logs/*
+!logs/.gitkeep
+
+# --- PyInstaller (Appendix D) -----------------------------------------------
+dist/
+build/
+*.spec
+
+# --- Editors / OS junk (Windows target: keep Thumbs.db + desktop.ini) -------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

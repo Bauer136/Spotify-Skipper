@@ -1,0 +1,9 @@
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.14
+numpy>=1.26,<2.0
+spotipy==2.24.0
+python-dotenv==1.0.1
+platformdirs==4.2.2
+# Phase 6 (optional ML path) — omit if you stay rule-based
+scikit-learn==1.5.1
+joblib==1.4.2
