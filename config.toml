@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------- camera
+[camera]
+device  = "c270"  # Linux: 0 -> /dev/video0. Windows: 0 -> first DirectShow cam.
+width   = 640
+height  = 480
+fps     = 30
+mirror  = true       # keep true: user-right == image-right (see Phase 2.1)
+backend = "auto"     # auto | v4l2 | dshow | msmf | any
+threaded = true      # overlap capture with inference; false = old serial path
+
+# ---------------------------------------------------------------- tracking
+[hands]
+model_path               = "models/hand_landmarker.task"
+num_hands                = 1
+min_detection_confidence = 0.6
+min_presence_confidence  = 0.6
+min_tracking_confidence  = 0.6
+
+# ---------------------------------------------------------------- pose (L2)
+[pose]
+backend        = "rules"                     # rules | ml
+ml_model_path  = "models/pose_clf.joblib"
+ml_min_conf    = 0.75
+smoothing_frames = 3                         # majority vote window
+min_hand_scale = 0.05                        # reject implausibly small hands
+max_hand_scale = 0.60                        # ...and implausibly large ones
+
+# ---------------------------------------------------------------- gesture (L3/L4)
+[gesture]
+type                = "transition"   # transition | motion | hold
+cooldown_s          = 3.0
+release_frames      = 5
+
+# --- used when type = "transition" (the default gesture; see 4.4.2) ---
+stage_a_pose        = "ZERO"       # the "O" — arms the gesture
+stage_b_pose        = "OK_THREE"   # three fingers up — fires it
+arm_frames          = 5            # consecutive stage-A frames needed to arm
+max_transition_s    = 0.60         # B must arrive within this of leaving A
+min_transition_s    = 0.05
+confirm_frames      = 2
+max_drift           = 0.80         # hand-widths the hand may wander, A -> B
+min_conf            = 0.50
+pose_grace_frames   = 2
+
+# --- used only when type = "motion" (the swipe; see 4.4) ---
+trigger_pose        = "OPEN_PALM"
+direction           = "right"
+arm_stillness       = 0.55
+travel_hand_widths  = 1.6
+min_duration_s      = 0.10
+max_duration_s      = 0.70
+lateral_ratio       = 0.60
+monotonic_ratio     = 0.80
+confirm_s           = 0.40    # wave rejection window; see 4.4. 0 disables it
+reversal_ratio      = 0.50    # cancel if the hand returns this fraction of the way back
+
+# --- used only when type = "hold" (see 4.4.1) ---
+hold_s              = 1.2
+
+# ---------------------------------------------------------------- action
+[spotify]
+enabled      = true
+cache_path   = ".spotify_token_cache"
+device_id    = ""        # "" = whatever device is currently active
+
+# ---------------------------------------------------------------- runtime
+[app]
+preview    = true        # show the debug window; set false for background operation
+log_level  = "INFO"
+log_file   = "logs/skipper.log"
+beep       = true        # audible confirmation when a gesture fires

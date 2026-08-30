@@ -1,4 +1,5 @@
 # scripts/calibrate_pose.py  — hold the pose, read the numbers, set the constants
+import argparse
 import sys
 from pathlib import Path
 
@@ -11,13 +12,21 @@ import cv2, numpy as np
 from src.spotify_skipper.camera import Camera
 from src.spotify_skipper.hands import HandTracker
 from src.spotify_skipper import features as F
+from src.spotify_skipper.config import camera_kwargs, load_config
 from src.spotify_skipper.gestures.poses import classify_pose
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--camera", metavar="SPEC", default=None,
+                    help="camera index, /dev path, or name fragment; overrides "
+                         "config.toml. `python scripts/cameras.py` lists them.")
+    args = ap.parse_args()
+    cam_kw = camera_kwargs(load_config(), args.camera)
+
     # absolute, so calibration works from any working directory
     tracker = HandTracker(model_path=ROOT / "models" / "hand_landmarker.task")
-    with Camera() as cam:
+    with Camera(**cam_kw) as cam:
         while True:
             fr = cam.read()
             if fr is None: break

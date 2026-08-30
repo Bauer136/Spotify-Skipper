@@ -280,10 +280,76 @@ downstream is consistent.
 from __future__ import annotations
 
 import platform
+import threading
 import time
 from dataclasses import dataclass
 
 import cv2
+
+from .devices import format_table, list_devices, probe, resolve
+
+
+def _api_for_backend(backend: str = "auto") -> int:
+    """OpenCV capture backend for this platform (or an explicit override)."""
+    if backend != "auto":
+        return getattr(cv2, f"CAP_{backend.upper()}")
+    system = platform.system()
+    if system == "Windows":
+        return cv2.CAP_DSHOW      # opens far faster than MSMF, fewer surprises
+    if system == "Linux":
+        return cv2.CAP_V4L2
+    return cv2.CAP_ANY            # macOS -> AVFoundation via CAP_ANY
+
+
+class _FrameGrabber(threading.Thread):
+    """Reads the camera as fast as it will go, keeping only the NEWEST frame.
+
+    Without this, capture and MediaPipe inference run serially and you pay both costs
+    per frame: ~20 FPS capture plus ~20 FPS inference gives ~10 FPS end to end
+    (1/(1/20 + 1/20)). Overlapping them costs the max of the two, not the sum.
+
+    Only the newest frame is kept. If the consumer is slower than the camera the
+    intermediate frames are dropped rather than queued — a gesture recogniser wants
+    the freshest view of the world, not a backlog of stale ones.
+    """
+
+    def __init__(self, cap, t0):
+        super().__init__(daemon=True, name="camera-grabber")
+        self._cap, self._t0 = cap, t0
+        self._cond = threading.Condition()
+        self._frame = None          # (image, timestamp_ms), cleared once consumed
+        self._stopping = threading.Event()
+        self.captured = 0
+        self._eof = False
+        self.dropped = 0            # frames the consumer never saw
+
+    def run(self):
+        while not self._stopping.is_set():
+            ok, img = self._cap.read()
+            ts = int((time.monotonic() - self._t0) * 1000)
+            with self._cond:
+                if not ok:
+                    self._eof = True
+                    self._cond.notify_all()
+                    return
+                if self._frame is not None:
+                    self.dropped += 1        # consumer was busy; newest wins
+                self._frame = (img, ts)
+                self.captured += 1
+                self._cond.notify()
+
+    def take(self, timeout):
+        """Block until a frame the caller has not already seen is available."""
+        with self._cond:
+            if self._frame is None and not self._eof:
+                self._cond.wait(timeout)
+            if self._frame is None:
+                return None
+            f, self._frame = self._frame, None
+            return f
+
+    def stop(self):
+        self._stopping.set()
 
 
 @dataclass
@@ -295,32 +361,34 @@ class Frame:
 
 class Camera:
     def __init__(self, device=0, width=640, height=480, fps=30, mirror=True,
-                 backend="auto"):
+                 backend="auto", threaded=True, read_timeout_s=2.0):
         self.device, self.width, self.height = device, width, height
         self.fps, self.mirror, self.backend = fps, mirror, backend
+        self.threaded, self.read_timeout_s = threaded, read_timeout_s
+        self._grabber = None
         self.cap = None
+        self.resolved = None
         self._i = 0
         self._t0 = None
 
     # --- backend selection -------------------------------------------------
     def _api(self) -> int:
-        if self.backend != "auto":
-            return getattr(cv2, f"CAP_{self.backend.upper()}")
-        system = platform.system()
-        if system == "Windows":
-            return cv2.CAP_DSHOW      # opens far faster than MSMF, fewer surprises
-        if system == "Linux":
-            return cv2.CAP_V4L2
-        return cv2.CAP_ANY            # macOS -> AVFoundation via CAP_ANY
+        return _api_for_backend(self.backend)
 
     # --- lifecycle ---------------------------------------------------------
     def open(self):
-        self.cap = cv2.VideoCapture(self.device, self._api())
+        # `device` may be an index, a /dev path, or a name fragment like "logitech".
+        # Resolving here (not at construction) keeps hot-plugged cameras working.
+        target = resolve(self.device)
+        self.resolved = target
+        self.cap = cv2.VideoCapture(target, self._api())
         if not self.cap.isOpened():
             raise RuntimeError(
-                f"Could not open camera {self.device!r}. "
-                "Linux: check `v4l2-ctl --list-devices` and that nothing else holds it. "
-                "Windows: check Settings > Privacy > Camera > 'Let desktop apps access'."
+                f"Could not open camera {self.device!r} (resolved to {target!r}).\n"
+                f"{format_table(probe(list_devices()))}\n"
+                "Pick one of the rows marked PROBE=OK above — a 'meta' node never "
+                "delivers frames. Linux: check nothing else holds the camera. "
+                "Windows: Settings > Privacy > Camera > 'Let desktop apps access'."
             )
         # MJPG lets most webcams hit 30 fps at 640x480; raw YUYV often caps at 10.
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -328,24 +396,53 @@ class Camera:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         # Keep latency low: never hand us a frame that is 5 frames old.
-        try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+        #
+        # ONLY in serial mode. A single V4L2 buffer stops the driver filling frame N+1
+        # while userspace holds frame N, which halves capture throughput (measured:
+        # 19.9 -> 10.0 FPS on a C270). Threaded mode gets freshness a better way — the
+        # grabber drains the ring and keeps only the newest frame — so it leaves the
+        # driver's default buffering alone and gets the full frame rate.
+        if not self.threaded:
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
         self._t0 = time.monotonic()
+        if self.threaded:
+            self._grabber = _FrameGrabber(self.cap, self._t0)
+            self._grabber.start()
         return self
 
     def read(self) -> Frame | None:
-        ok, img = self.cap.read()
-        if not ok:
-            return None
+        if self._grabber is not None:
+            got = self._grabber.take(self.read_timeout_s)
+            if got is None:
+                return None
+            img, ts = got
+        else:
+            ok, img = self.cap.read()
+            if not ok:
+                return None
+            ts = int((time.monotonic() - self._t0) * 1000)
+        # mirrored exactly once, here — never in the grabber, so frames that get
+        # dropped are never flipped for nothing (Phase 2.1 invariant)
         if self.mirror:
             img = cv2.flip(img, 1)
-        ts = int((time.monotonic() - self._t0) * 1000)
         self._i += 1
         return Frame(image=img, timestamp_ms=ts, index=self._i)
 
+    @property
+    def dropped(self) -> int:
+        """Frames captured but never consumed — nonzero means inference is the limit."""
+        return self._grabber.dropped if self._grabber else 0
+
     def close(self):
+        # stop and join BEFORE release: releasing while the thread sits in cap.read()
+        # crashes inside OpenCV
+        if self._grabber is not None:
+            self._grabber.stop()
+            self._grabber.join(timeout=2.0)
+            self._grabber = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
@@ -365,6 +462,36 @@ class Camera:
 - Backend selection is a function, not a constant, so the same file runs on both OSes.
 - Failures raise with the *fix* in the message; you will read that message on the
   Windows box at 11 pm.
+
+**Why capture runs on a thread** (measured on a Logitech C270 + Intel UHD 620):
+
+| Configuration | End-to-end FPS |
+|---|---|
+| serial capture, `CAP_PROP_BUFFERSIZE = 1` | 10 |
+| threaded capture, driver's default buffering | **28** |
+
+Two effects compound, and the second is the one that surprises people:
+
+1. **Serial capture pays both costs per frame.** Capture (~20 FPS) followed by
+   inference (~20 FPS) is `1/(1/20 + 1/20)` ≈ 10 FPS, not 20. Overlapping them on a
+   thread costs the *max* of the two rather than the sum. This works because MediaPipe
+   releases the GIL during inference — verified with a Python spinner, which held 99 %
+   of its idle tick rate while the landmarker ran.
+2. **`CAP_PROP_BUFFERSIZE = 1` halves capture throughput.** With one V4L2 buffer the
+   driver cannot fill frame N+1 while userspace still holds frame N. Free-running
+   capture measured 10.0 FPS with it set and 19.9 FPS without. It is a latency
+   optimisation that costs you half your frame rate.
+
+The grabber gets low latency a better way: it drains the driver's ring and keeps only
+the **newest** frame, dropping anything the consumer was too slow to take. You get
+freshness *and* full throughput, so `BUFFERSIZE = 1` is applied only on the serial
+path (`threaded = false`), which exists as an escape hatch.
+
+Note the frame is still mirrored exactly once, in `read()` rather than in the grabber —
+so frames that get dropped are never flipped for nothing, and the 2.1 invariant holds.
+
+`Camera.dropped` reports frames captured but never consumed. Nonzero means inference,
+not the camera, is your limit.
 
 ### 2.3 Smoke test
 
@@ -391,6 +518,10 @@ EOF
 
 You see yourself, mirrored (raise your right hand — it appears on the right of the
 window), at **≥ 25 FPS**. If FPS is < 15, see [Appendix B](#appendix-b--troubleshooting).
+
+This is capture only, so it should be near your camera's ceiling. The number that
+matters for Phase 4 is capture *plus* MediaPipe — check that at 3.4, and if it is
+roughly half this one, you are on the serial path.
 
 ---
 
@@ -2005,6 +2136,18 @@ from . import features as F
 LABEL_MAP = {"pose_zero": "ZERO", "pose_ok_three": "OK_THREE"}
 DEFAULT_LABEL = "NONE"
 
+# Some clips must be EXCLUDED, not defaulted, because they are decoys at the GESTURE
+# level but not at the POSE level:
+#   skip_transition — contains real ZERO frames, real OK_THREE frames, and ambiguous
+#                     ones between. No single frame label is correct.
+#   decoy_hold_o    — "form the O and just hold it" is a perfect ZERO to L2. Labelling
+#                     it NONE tells the classifier the same hand shape is both ZERO and
+#                     not-ZERO. Measured: including it costs 3.4 points of CV accuracy
+#                     (0.922 -> 0.888), and ZERO-vs-hold_o separability is only 0.846.
+# Rejecting a held O is L3's job, not L2's — TransitionDetector already does it
+# (arming is not firing). Both labels are for replay scoring (6.1) only.
+EXCLUDE_FROM_TRAINING = {"skip_transition", "decoy_hold_o"}
+
 
 def load_dataset(clips_dir: Path):
     X, y, groups = [], [], []
@@ -2012,7 +2155,10 @@ def load_dataset(clips_dir: Path):
         d = np.load(p, allow_pickle=True)
         lm, hd = d["landmarks"], d["handedness"]
         w, h = int(d["frame_w"]), int(d["frame_h"])
-        label = LABEL_MAP.get(str(d["label"]), DEFAULT_LABEL)
+        raw_label = str(d["label"])
+        if raw_label in EXCLUDE_FROM_TRAINING:
+            continue
+        label = LABEL_MAP.get(raw_label, DEFAULT_LABEL)
         for i in range(len(lm)):
             if np.isnan(lm[i]).any() or hd[i] < 0:
                 continue
@@ -2739,6 +2885,7 @@ height  = 480
 fps     = 30
 mirror  = true       # keep true: user-right == image-right (see Phase 2.1)
 backend = "auto"     # auto | v4l2 | dshow | msmf | any
+threaded = true      # overlap capture with inference; false = old serial path
 
 # ---------------------------------------------------------------- tracking
 [hands]
@@ -3526,7 +3673,9 @@ distance (Phase 4.2), never as raw y-coordinates.
 |---|---|---|
 | `Could not open camera 0` (Linux) | device busy or wrong index | `v4l2-ctl --list-devices`; try `device = 2`; close Zoom/Chrome |
 | Black frames on Windows | app camera permission off | Settings → Privacy & security → Camera → allow desktop apps |
-| Opens but 5–10 FPS | webcam is delivering raw YUYV | keep the MJPG `CAP_PROP_FOURCC` line from Phase 2.2 |
+| Opens but 5–10 FPS | **serial capture** — the usual cause | confirm `threaded = true` in `config.toml`; check `Camera.dropped` is 0 and compare capture-only FPS (2.3) with capture+MediaPipe (3.4). Roughly half means serial |
+| Still slow with `threaded = true` | webcam delivering raw YUYV | keep the MJPG `CAP_PROP_FOURCC` line from Phase 2.2 — though some cameras (e.g. the C270) offer no MJPG mode and forcing it changes nothing |
+| FPS varies with room lighting | `exposure_dynamic_framerate` lets the driver lengthen exposure by dropping frames | Linux: `v4l2-ctl -d /dev/videoN -c exposure_dynamic_framerate=0`, or pin `auto_exposure=1` + `exposure_time_absolute` |
 | 3–5 s freeze on start (Windows) | MSMF backend probing | force `backend = "dshow"` |
 | Image is not mirrored | `mirror = false` | set it true; do not compensate downstream |
 | `/dev/video1` is the real camera | multi-endpoint UVC device | many webcams expose a metadata node at `video1`; use whichever index returns frames |
