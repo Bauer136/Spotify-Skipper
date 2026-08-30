@@ -5,12 +5,13 @@ returning a `GestureEvent` or None, plus `.state` and `.last_reason` for the HUD
 
   * `TransitionDetector` (4.4.2) — fires on a POSE CHANGE in place. The default.
   * `HoldDetector`       (4.4.1) — fires when one pose is held still long enough.
-  * `MotionDetector`     (4.4)   — fires on a directed travel. NOT YET WRITTEN.
+  * `MotionDetector`     (4.4)   — fires on a directed travel.
 
 Everything spatial is measured in hand-widths, never pixels (see Phase 4.2).
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -48,6 +49,211 @@ def _drift(sample: Sample, anchor: Sample) -> float:
     """Distance from the anchor, in anchor hand-widths."""
     return float(np.linalg.norm(sample.center - anchor.center)
                  / max(1e-6, anchor.scale))
+
+
+# ============================================================== 4.4 motion
+@dataclass
+class MotionConfig:
+    trigger_pose: str = "OPEN_PALM"
+    direction: str = "right"        # right | left | up | down
+    arm_frames: int = 6             # consecutive pose frames needed to arm (~0.25 s)
+    arm_stillness: float = 0.55     # max hand-widths/sec of drift while arming
+    travel_hand_widths: float = 1.6 # required displacement, in hand widths
+    max_duration_s: float = 0.70    # must complete within this
+    min_duration_s: float = 0.10    # ...but not faster than this (rejects jitter)
+    lateral_ratio: float = 0.60     # |cross-axis| must stay under this * |along-axis|
+    monotonic_ratio: float = 0.80   # >=80% of frames must move the right way
+    pose_grace_frames: int = 3      # pose may flicker off for this many frames
+    confirm_s: float = 0.40         # hold-still window that separates swipe from wave
+    reversal_ratio: float = 0.50    # cancel if the hand returns this far back
+    cooldown_s: float = 3.0
+    release_frames: int = 5         # frames without the pose before re-arming
+
+
+_AXIS = {"right": (0, +1.0), "left": (0, -1.0), "down": (1, +1.0), "up": (1, -1.0)}
+
+
+class MotionDetector:
+    """Feed one Sample per frame; get a GestureEvent (or None) back."""
+
+    def __init__(self, cfg: MotionConfig, name: str = "skip"):
+        self.cfg, self.name = cfg, name
+        self.state = State.IDLE
+        self.buf: deque[Sample] = deque(maxlen=90)     # ~3 s of history
+        self._pose_run = 0
+        self._miss_run = 0
+        self._release_run = 0
+        self._armed_at: Sample | None = None
+        self._pending: tuple | None = None
+        self._cooldown_until = 0.0
+        self.last_reason = ""       # why we did NOT fire — invaluable when tuning
+
+    # -- helpers -----------------------------------------------------------
+    def _speed(self, n=4) -> float:
+        """Recent PATH speed in hand-widths per second, over up to n+1 samples.
+
+        Path length, not net displacement: across a direction reversal the net
+        displacement cancels to ~0 and a waving hand would look 'at rest' exactly at
+        its turning points -- which is precisely where a wave would otherwise anchor
+        a fresh gesture window. Measuring distance travelled removes that hole.
+        """
+        seg = list(self.buf)[-(n + 1):]
+        if len(seg) < 2:
+            return 0.0
+        dist = sum(float(np.linalg.norm(b.center - a.center))
+                   for a, b in zip(seg, seg[1:]))
+        dt = max(1e-3, seg[-1].t - seg[0].t)
+        return dist / max(1e-6, seg[-1].scale) / dt
+
+    def _reset(self, state=State.IDLE):
+        self.state = state
+        self._armed_at = None
+        self._pending = None
+        self._pose_run = 0
+        self._miss_run = 0
+
+    def _reanchor_or_expire(self, sample: "Sample", dt: float, speed: float):
+        """Slide the anchor forward ONLY to a rest point; otherwise abandon.
+
+        Re-anchoring to a moving frame would let the second half of a wave start a
+        fresh window and fire. Dropping to IDLE forces a full re-arm (pose held +
+        stillness), which an oscillating hand can never satisfy.
+        """
+        if speed <= self.cfg.arm_stillness:
+            self._armed_at = sample                 # new rest point
+        elif dt > self.cfg.max_duration_s:
+            self.last_reason = "window expired without a rest point"
+            self._reset(State.IDLE)
+
+    # -- main --------------------------------------------------------------
+    def update(self, sample: Sample | None, now: float) -> GestureEvent | None:
+        cfg = self.cfg
+
+        # ---- cooldown / release gating ----------------------------------
+        if self.state in (State.COOLDOWN, State.FIRED):
+            if now < self._cooldown_until:
+                self.state = State.COOLDOWN
+                return None
+            self.state = State.RESET
+            self._release_run = 0
+
+        # ---- PENDING: confirm the travel was not half of an oscillation ---
+        if self.state is State.PENDING:
+            event, deadline, anchor_center, along0, scale0 = self._pending
+            axis, sign = _AXIS[cfg.direction]
+            if sample is not None:
+                self.buf.append(sample)
+                back = float(sample.center[axis] - anchor_center[axis]) * sign / scale0
+                if back < along0 * (1.0 - cfg.reversal_ratio):
+                    # the hand came back -> this was a wave, not a swipe
+                    self.last_reason = f"reversed to {back:.2f} of {along0:.2f} (wave)"
+                    self._reset(State.IDLE)
+                    return None
+            # a hand that vanished mid-window left the frame in the swipe direction:
+            # that is consistent with a swipe, so we let the timer run.
+            if now >= deadline:
+                self.state = State.FIRED
+                self._cooldown_until = now + cfg.cooldown_s
+                self._pending = None
+                self.last_reason = "fired"
+                return event
+            return None
+
+        if self.state is State.RESET:
+            # One continuous motion must never fire twice. Re-arm only after the user
+            # either drops the trigger pose or brings the hand back to rest.
+            if sample is not None:
+                self.buf.append(sample)
+            settled = (sample is None or sample.pose != cfg.trigger_pose
+                       or self._speed() <= cfg.arm_stillness)
+            if settled:
+                self._release_run += 1
+                if self._release_run >= cfg.release_frames:
+                    self._reset(State.IDLE)
+            else:
+                self._release_run = 0
+            return None
+
+        # ---- no hand this frame -----------------------------------------
+        if sample is None:
+            self._miss_run += 1
+            if self._miss_run > cfg.pose_grace_frames:
+                self._reset(State.IDLE)
+            return None
+
+        self.buf.append(sample)
+
+        # ---- pose bookkeeping -------------------------------------------
+        if sample.pose == cfg.trigger_pose:
+            self._pose_run += 1
+            self._miss_run = 0
+        else:
+            self._miss_run += 1
+            if self._miss_run > cfg.pose_grace_frames:
+                self._reset(State.IDLE)
+                self.last_reason = "pose lost"
+                return None
+
+        # ---- IDLE -> ARMED ----------------------------------------------
+        if self.state is State.IDLE:
+            if self._pose_run >= cfg.arm_frames and self._speed() <= cfg.arm_stillness:
+                self.state = State.ARMED
+                self._armed_at = sample
+            return None
+
+        # ---- ARMED: look for the travel ---------------------------------
+        # INVARIANT: the travel window always starts from a REST point. This is what
+        # makes waving impossible to confuse with a swipe -- a wave never rests.
+        anchor = self._armed_at
+        dt = sample.t - anchor.t
+        speed = self._speed()
+
+        if dt < cfg.min_duration_s:
+            return None
+
+        axis, sign = _AXIS[cfg.direction]
+        cross = 1 - axis
+        delta = sample.center - anchor.center
+        scale = max(1e-6, anchor.scale)
+        along = float(delta[axis] * sign) / scale
+        lateral = abs(float(delta[cross])) / scale
+
+        if along < cfg.travel_hand_widths or lateral > cfg.lateral_ratio * max(along, 1e-6):
+            if along >= cfg.travel_hand_widths:
+                self.last_reason = f"too diagonal ({lateral:.2f} vs {along:.2f})"
+            else:
+                self.last_reason = f"travel {along:.2f} < {cfg.travel_hand_widths}"
+            self._reanchor_or_expire(sample, dt, speed)
+            return None
+
+        # monotonicity: of the frames that actually MOVED, nearly all must move the
+        # right way. Near-zero steps are excluded, otherwise the still frames at the
+        # start of the window drag the ratio below threshold and nothing ever fires.
+        seg = [s for s in self.buf if s.t >= anchor.t]
+        peak = 0.0
+        if len(seg) >= 3:
+            steps = np.diff([s.center[axis] for s in seg]) * sign
+            moving = np.abs(steps) > 0.02 * scale        # noise floor
+            if moving.sum() >= 2:
+                good = float(np.mean(steps[moving] > 0))
+                if good < cfg.monotonic_ratio:
+                    self.last_reason = f"not monotonic ({good:.2f})"
+                    self._reanchor_or_expire(sample, dt, speed)
+                    return None
+            dts = np.diff([s.t for s in seg])
+            peak = float(np.max(np.abs(steps)) / scale / max(1e-3, float(np.mean(dts))))
+
+        # ---- candidate accepted; confirm before firing --------------------
+        event = GestureEvent(self.name, now, along, dt, peak)
+        if cfg.confirm_s <= 0:
+            self.state = State.FIRED
+            self._cooldown_until = now + cfg.cooldown_s
+            self.last_reason = "fired"
+            return event
+        self.state = State.PENDING
+        self._pending = (event, now + cfg.confirm_s, anchor.center.copy(), along, scale)
+        self.last_reason = "confirming"
+        return None
 
 
 # ============================================================ 4.4.1 hold
