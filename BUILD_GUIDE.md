@@ -27,7 +27,7 @@ Target: build and tune on **Linux**, then deploy the same source tree to a
 | [1](#phase-1--project-scaffold) | Repo scaffold, venv, dependencies | 20 min |
 | [2](#phase-2--camera-capture-layer) | Cross-platform camera capture | 20 min |
 | [3](#phase-3--hand-tracking-layer) | MediaPipe HandLandmarker wrapper | 30 min |
-| [4](#phase-4--the-custom-gesture-engine) | **The gesture engine** (features, poses, motion FSM, ML path) | 2–3 h |
+| [4](#phase-4--the-custom-gesture-engine) | **The gesture engine** (features, poses, transition/motion/hold FSMs, ML path) | 2–3 h |
 | [5](#phase-5--gesture-data-recorder) | Dataset recorder (landmarks only, no video) | 40 min |
 | [6](#phase-6--training-and-offline-evaluation) | Train / replay / tune harness | 1 h |
 | [7](#phase-7--spotify-integration) | PKCE auth + the single skip call | 45 min |
@@ -56,18 +56,27 @@ Target: build and tune on **Linux**, then deploy the same source tree to a
 
 ### 0.2 The gesture (default spec)
 
-The default trigger is a **deliberate open-palm swipe to the right**, chosen because
-it almost never occurs by accident:
+The default trigger is a **pose transition**, not a movement: the hand forms an "O"
+(thumb and index touching, the other three fingers curled), then the middle, ring and
+pinky spring up while the O stays closed. It is a shape change in place — the hand
+does not travel.
 
-1. Hand is visible with an **open palm** (all four fingers extended, thumb out).
-2. Palm is held **roughly still** for ≥ 6 frames (~0.25 s) — this *arms* the gesture.
-3. Palm then travels **right** by ≥ 1.6 hand-widths within **0.7 s**, with vertical
-   drift < 60 % of horizontal travel.
-4. Fire → **3 s cooldown** → hand must leave the open-palm pose before re-arming.
+1. Hand forms **`ZERO`**: thumb-index loop closed, middle/ring/pinky curled.
+2. That pose is held for ≥ 5 frames — this *arms* the gesture.
+3. Middle, ring and pinky extend and fan while the loop stays closed → **`OK_THREE`**,
+   reached within **0.6 s** and without the hand wandering more than 0.8 hand-widths.
+4. Fire → **3 s cooldown** → the hand must return to `ZERO` before it can fire again.
+
+**Why a transition rather than a swipe.** A swipe's first stroke is physically identical
+to the first stroke of a wave, which is why the swipe FSM in 4.4 needs four separate
+guards (`lateral_ratio`, `monotonic_ratio`, `confirm_s`, `reversal_ratio`) and pays
+~0.4 s of latency for the last one. A closed thumb-index loop has no such natural twin:
+nothing you do while working goes O → OK-sign. The transition detector is therefore both
+simpler *and* faster than the swipe it replaces.
 
 Every threshold above is a config value. Phase 4 explains how to define an entirely
-different gesture (fist-flick, peace-sign hold, thumb-flick, pinch-drag) with the
-same machinery.
+different gesture (open-palm swipe, fist-flick, peace-sign hold) with the same
+machinery — all three L3 detectors plug into the same slot.
 
 ### 0.3 Network egress budget (the "runs locally" requirement)
 
@@ -100,7 +109,7 @@ Copy this into your notes and tick as you go:
 [ ] M2  live webcam window with FPS counter (Phase 2)
 [ ] M3  21 landmarks drawn on your hand at >20 FPS (Phase 3)
 [ ] M4  on-screen debug shows pose name + engine state (Phase 4)
-[ ] M5  recorded >= 20 positive and >= 10 negative clips (Phase 5)
+[ ] M5  recorded >= 20 skip_transition and >= 15 decoy clips (Phase 5)
 [ ] M6  replay harness reports 0 false positives on negatives (Phase 6)
 [ ] M7  `python -m spotify_skipper.auth` prints "Authorised as <you>" (Phase 7)
 [ ] M8  `--dry-run` prints SKIP on gesture, nothing otherwise (Phase 8)
@@ -792,7 +801,7 @@ from ..features import (FINGER_ORDER, INDEX_TIP, MIDDLE_TIP,
 
 @dataclass(frozen=True)
 class PoseResult:
-    name: str          # "OPEN_PALM" | "FIST" | "PEACE" | "NONE"
+    name: str          # "OPEN_PALM" | "FIST" | "PEACE" | "ZERO" | "OK_THREE" | "NONE"
     confidence: float  # 0..1, a soft margin — used for hysteresis, not thresholds
 
 
@@ -803,12 +812,23 @@ OPENNESS_OPEN = 1.55 # mean fingertip distance from wrist, canonical units
 SPREAD_MIN = 0.25    # min mean gap between adjacent fingertips for OPEN_PALM
 PEACE_V_GAP = 0.35   # min index-tip to middle-tip distance for a convincing V
 
+# Skip-gesture poses: ZERO (the "O") -> OK_THREE. Deliberately separate constants
+# from EXT_OPEN/EXT_CURL above: these two rules get retuned often, and sharing the
+# thresholds would move OPEN_PALM and FIST every time the skip gesture is adjusted.
+CIRCLE_MAX = 0.30    # max thumb-tip to index-tip distance for the loop to count as closed
+ZERO_INDEX_MIN = 0.72  # index is bent into the loop, NOT fully curled — separates O from FIST
+EXT_CURL_3 = 0.72    # middle/ring/pinky this bent count as curled (stage A)
+EXT_OPEN_3 = 0.90    # ...and this straight count as extended (stage B)
+SPREAD_MIN_3 = 0.22  # min mean middle-ring / ring-pinky tip gap once they come up
+
 # Typical measured values (canonical units, where |wrist -> middle MCP| == 1).
 # Use these as sanity bounds, then replace them with YOUR numbers from 4.3's
 # calibration procedure:
 #   open palm : four_ext 0.93-1.00 | openness 1.70-2.10 | spread 0.28-0.45
 #   fist      : four_ext 0.55-0.70 | openness 0.80-1.05 | spread 0.10-0.25
 #   relaxed   : four_ext 0.75-0.90 | openness 1.30-1.60  <- the dangerous middle ground
+# ZERO / OK_THREE thresholds above are starting points only — no measured ranges
+# exist for them yet. Calibrate before trusting them (scripts/calibrate_pose.py).
 
 
 def _states(canon: np.ndarray) -> dict[str, float]:
@@ -822,6 +842,17 @@ def _margin(value: float, lo: float, hi: float) -> float:
     return float(np.clip((value - lo) / (hi - lo), 0.0, 1.0))
 
 
+def _circle_gap(canon: np.ndarray) -> float:
+    """Thumb-tip to index-tip distance — spreads()[0]. Small when the O is closed."""
+    return float(spreads(canon)[0])
+
+
+def _three_spread(canon: np.ndarray) -> float:
+    """Mean middle-ring and ring-pinky tip gap — spreads()[2:4]. How fanned the
+    three fingers are once they come up."""
+    return float(np.mean(spreads(canon)[2:4]))
+
+
 def classify_pose(canon: np.ndarray) -> PoseResult:
     e = _states(canon)
     openness = palm_openness(canon)
@@ -829,6 +860,24 @@ def classify_pose(canon: np.ndarray) -> PoseResult:
 
     four_ext = min(e["index"], e["middle"], e["ring"], e["pinky"])
     four_curl = max(e["index"], e["middle"], e["ring"], e["pinky"])
+
+    gap = _circle_gap(canon)
+    three = (e["middle"], e["ring"], e["pinky"])
+
+    # ZERO (skip gesture, stage A): thumb-index loop closed, other three curled.
+    # The index guard is what separates this from a FIST — in a fist the index is
+    # fully curled into the palm; here it is only bent around the loop.
+    if (gap <= CIRCLE_MAX and e["index"] >= ZERO_INDEX_MIN
+            and max(three) <= EXT_CURL_3):
+        return PoseResult("ZERO", min(_margin(CIRCLE_MAX - gap, 0.0, 0.12),
+                                      _margin(EXT_CURL_3 - max(three), 0.0, 0.10)))
+
+    # OK_THREE (skip gesture, stage B): loop still closed, three fingers up and fanned
+    if (gap <= CIRCLE_MAX and min(three) >= EXT_OPEN_3
+            and _three_spread(canon) >= SPREAD_MIN_3):
+        return PoseResult("OK_THREE", min(_margin(CIRCLE_MAX - gap, 0.0, 0.12),
+                                          _margin(min(three), EXT_OPEN_3 - 0.08,
+                                                  EXT_OPEN_3 + 0.06)))
 
     # OPEN_PALM: all four fingers straight, thumb out, fingers fanned, hand "big"
     if (four_ext >= EXT_OPEN and e["thumb"] >= 0.85
@@ -886,9 +935,17 @@ cv2.destroyAllWindows()
 
 Procedure:
 
-1. Hold your **open palm** at three distances (30 cm, 60 cm, 100 cm) and three
-   rotations (upright, tilted left 30°, tilted right 30°). Write down the **minimum**
-   `four_ext`, `openness` and `spread` you observe.
+1. Hold each pose you actually use at three distances (30 cm, 60 cm, 100 cm) and three
+   rotations (upright, tilted left 30°, tilted right 30°), and write down the worst
+   value you observe. **Which extreme is "worst" depends on the direction of the gate.**
+   For a `>=` gate (open palm's `four_ext`, `OK_THREE`'s `three_ext`/`three_spread`)
+   record the **minimum**. For a `<=` gate (`ZERO`'s `three_ext`, and `circle_gap` in
+   both skip poses) record the **maximum**. Record `scale` in every cell too: if a cell
+   sits outside `min_hand_scale .. max_hand_scale` those frames never reach L2 at all,
+   and must not drag the threshold with them.
+
+   Use the value that *holds* for ~0.25 s, not the worst single frame — L2 is majority-
+   voted over `smoothing_frames` and a lone bad frame is already absorbed downstream.
 2. Hold **five non-gestures** — relaxed hand on the desk, holding a mug, typing pose,
    pointing, waving hello — and write down the **maximum** values.
 3. Set each threshold **midway** between the two, biased toward the non-gesture side.
@@ -898,9 +955,28 @@ Procedure:
 Record the numbers in a comment block in `poses.py`. Future you (or a future agent)
 will need them when the recogniser drifts.
 
-### 4.4 L3 — the motion state machine
+> **The default thresholds do not separate the poses on the guide's own numbers.**
+> `EXT_OPEN = 0.90` sits exactly at the top of the documented *relaxed* range
+> (0.75–0.90) and `OPENNESS_OPEN = 1.55` sits below it (1.30–1.60), so a worst-case
+> relaxed hand passes both OPEN_PALM gates. `CIRCLE_MAX`, `ZERO_INDEX_MIN`,
+> `EXT_CURL_3`, `EXT_OPEN_3` and `SPREAD_MIN_3` are starting points with no measured
+> ranges behind them at all. Calibrate before trusting any of them.
+
+**The false positive to hunt for the skip poses:** every one of `ZERO`'s gates is an
+*upper* bound, so its natural failure is a lazy half-curled hand with the thumb resting
+near the index. Watch for `ZERO` appearing while you are not gesturing; if it does,
+lower `CIRCLE_MAX` and raise `ZERO_INDEX_MIN`. A natural "OK" hand sign made while
+talking is the corresponding risk for `OK_THREE`.
+
+### 4.4 L3 — the gesture state machines
 
 `src/spotify_skipper/gestures/motion.py`
+
+Three detectors live in this file and all three plug into the same L4 slot:
+`MotionDetector` (swipes, below), `HoldDetector` (4.4.1), and **`TransitionDetector`
+(4.4.2) — the one the default gesture uses.** Read `MotionDetector` anyway: its guards
+are the reference for *why* a temporal detector needs guards at all, and the swipe
+remains the best-documented alternative if you ever switch back.
 
 ```python
 
@@ -1201,12 +1277,16 @@ by design.
 
 **Choosing a different gesture** — all in config, no code changes:
 
-| Desired gesture | `trigger_pose` | `direction` | Notes |
+| Desired gesture | `type` | Key config | Notes |
 |---|---|---|---|
-| Open-palm swipe right (default) | `OPEN_PALM` | `right` | Best signal-to-noise. |
-| Swipe left = previous track | `OPEN_PALM` | `left` | Instantiate a *second* `MotionDetector` with its own action. |
-| Fist "punch" down | `FIST` | `down` | Raise `travel_hand_widths` to ~2.0; fists are small so hand-width units shrink. |
-| Peace-sign hold (no motion) | `PEACE` | — | Use `HoldDetector` (4.4.1) instead. |
+| **O → three fingers (default)** | `transition` | `stage_a_pose = "ZERO"`, `stage_b_pose = "OK_THREE"` | No travel, no wave ambiguity, lowest latency. See 4.4.2. |
+| Open-palm swipe right | `motion` | `trigger_pose = "OPEN_PALM"`, `direction = "right"` | Best signal-to-noise *among swipes*; pays `confirm_s` latency for wave rejection. |
+| Swipe left = previous track | `motion` | `direction = "left"` | Instantiate a *second* `MotionDetector` with its own action. |
+| Fist "punch" down | `motion` | `trigger_pose = "FIST"`, `direction = "down"` | Raise `travel_hand_widths` to ~2.0; fists are small so hand-width units shrink. |
+| Peace-sign hold (no motion) | `hold` | `trigger_pose = "PEACE"` | Use `HoldDetector` (4.4.1). |
+
+Adding a *new* transition (say `FIST` → `OPEN_PALM`) is two constants in `config.toml`
+and nothing else, provided both poses already have rules in `poses.py`.
 
 #### 4.4.1 Alternative L3: hold detector (motionless gestures)
 
@@ -1270,6 +1350,190 @@ class HoldDetector:
         return None
 ```
 
+#### 4.4.2 Default L3: transition detector (pose-change gestures)
+
+The default gesture is a **shape change in place**: `ZERO` (the "O") held steadily,
+then `OK_THREE` (three fingers up, loop still closed) within a short window, with the
+hand essentially stationary throughout. Nothing here measures travel.
+
+Note what is *absent* compared with `MotionDetector`, and why. `direction`, `_AXIS`,
+`travel_hand_widths`, `lateral_ratio` and `monotonic_ratio` describe a trajectory this
+gesture does not have. `confirm_s` and `reversal_ratio` exist solely to tell a swipe
+from the first stroke of a wave — a problem with no analogue here, because no natural
+hand motion passes through a closed thumb-index loop on its way to an OK sign. Dropping
+the confirmation window is what makes this gesture fire ~0.4 s sooner than the swipe.
+
+Stillness is guarded by cumulative **drift** rather than path speed. `MotionDetector`
+needs `_speed()` because a waving hand is momentarily motionless at its turning points;
+a stationary gesture has no turning points, so "how far has the hand wandered from where
+it started" is both simpler and the quantity you actually care about.
+
+```python
+@dataclass
+class TransitionConfig:
+    stage_a_pose: str = "ZERO"        # the "O" — what arms the gesture
+    stage_b_pose: str = "OK_THREE"    # three fingers up — what fires it
+    arm_frames: int = 5               # consecutive stage-A frames needed to arm
+    max_transition_s: float = 0.60    # B must arrive within this of leaving A
+    min_transition_s: float = 0.05    # ...but not instantly (rejects tracking pops)
+    confirm_frames: int = 2           # consecutive stage-B frames needed to fire
+    max_drift: float = 0.80           # hand-widths the hand may wander, A -> B
+    min_conf: float = 0.50
+    pose_grace_frames: int = 2        # frames of NONE tolerated mid-transition
+    cooldown_s: float = 3.0
+    release_frames: int = 5           # frames off stage B before re-arming
+
+
+def _drift(sample: "Sample", anchor: "Sample") -> float:
+    """Distance from the anchor, in anchor hand-widths."""
+    return float(np.linalg.norm(sample.center - anchor.center)
+                 / max(1e-6, anchor.scale))
+
+
+class TransitionDetector:
+    """Fires on a POSE CHANGE rather than a movement.
+
+    States reuse the shared `State` enum: IDLE (collecting stage A) -> ARMED (stage A
+    held) -> PENDING (left stage A, waiting for stage B) -> FIRED -> COOLDOWN -> RESET.
+    """
+
+    def __init__(self, cfg: TransitionConfig, name: str = "skip"):
+        self.cfg, self.name = cfg, name
+        self.state = State.IDLE
+        self._pose_run = 0          # consecutive stage-A frames while arming
+        self._b_run = 0             # consecutive stage-B frames while confirming
+        self._miss_run = 0
+        self._release_run = 0
+        self._anchor: Sample | None = None   # drift reference while arming
+        self._last_a: Sample | None = None   # last stage-A frame = window start
+        self._cooldown_until = 0.0
+        self.last_reason = ""
+
+    def _reset(self, state=State.IDLE):
+        self.state = state
+        self._pose_run = self._b_run = self._miss_run = 0
+        self._anchor = self._last_a = None
+
+    def update(self, sample: "Sample | None", now: float) -> "GestureEvent | None":
+        cfg = self.cfg
+
+        # ---- cooldown / release gating ----------------------------------
+        if self.state in (State.COOLDOWN, State.FIRED):
+            if now < self._cooldown_until:
+                self.state = State.COOLDOWN
+                return None
+            self.state = State.RESET
+            self._release_run = 0
+
+        if self.state is State.RESET:
+            # After firing you are still holding stage B. Require it to be dropped
+            # before anything can arm again — this is what makes "reset, then wait
+            # for the O again" literal, and stops one long hold re-firing.
+            if sample is None or sample.pose != cfg.stage_b_pose:
+                self._release_run += 1
+                if self._release_run >= cfg.release_frames:
+                    self._reset(State.IDLE)
+            else:
+                self._release_run = 0
+            return None
+
+        # ---- no hand this frame -----------------------------------------
+        if sample is None:
+            self._miss_run += 1
+            if self._miss_run > cfg.pose_grace_frames:
+                self.last_reason = "hand lost"
+                self._reset(State.IDLE)
+            return None
+
+        in_a = sample.pose == cfg.stage_a_pose and sample.conf >= cfg.min_conf
+
+        # ---- IDLE: accumulate a steady stage A --------------------------
+        if self.state is State.IDLE:
+            if in_a:
+                if self._anchor is None:
+                    self._anchor = sample
+                if _drift(sample, self._anchor) > cfg.max_drift:
+                    self._anchor, self._pose_run = sample, 0   # moved: restart
+                self._pose_run += 1
+                self._last_a = sample
+                self._miss_run = 0
+                if self._pose_run >= cfg.arm_frames:
+                    self.state = State.ARMED
+                    self.last_reason = "armed"
+            else:
+                self._pose_run = 0
+                self._anchor = None
+            return None
+
+        # ---- still in stage A: slide the window start forward ------------
+        if in_a:
+            self._last_a = sample
+            self._miss_run = 0
+            if self.state is State.PENDING:      # fell back into the O; re-arm
+                self.state = State.ARMED
+                self._b_run = 0
+            return None
+
+        if self.state is State.ARMED:            # just left stage A
+            self.state = State.PENDING
+            self._b_run = 0
+
+        # ---- PENDING: the transition window ------------------------------
+        anchor = self._last_a
+        dt = sample.t - anchor.t
+        if dt > cfg.max_transition_s:
+            self.last_reason = f"transition window expired ({dt:.2f}s)"
+            self._reset(State.IDLE)
+            return None
+
+        drift = _drift(sample, anchor)
+        if drift > cfg.max_drift:
+            # the hand moved away instead of changing shape in place
+            self.last_reason = f"drifted {drift:.2f}hw during the transition"
+            self._reset(State.IDLE)
+            return None
+
+        if sample.pose == cfg.stage_b_pose and sample.conf >= cfg.min_conf:
+            self._b_run += 1
+            self._miss_run = 0
+            if dt < cfg.min_transition_s:
+                self.last_reason = "transition too fast (tracking pop?)"
+                return None
+            if self._b_run >= cfg.confirm_frames:
+                self.state = State.FIRED
+                self._cooldown_until = now + cfg.cooldown_s
+                self.last_reason = "fired"
+                event = GestureEvent(self.name, now, 0.0, dt, 0.0)
+                self._anchor = self._last_a = None
+                return event
+            return None
+
+        # anything else mid-window: tolerate a short flicker, then abandon
+        self._b_run = 0
+        self._miss_run += 1
+        if self._miss_run > cfg.pose_grace_frames:
+            self.last_reason = f"pose {sample.pose!r} interrupted the transition"
+            self._reset(State.IDLE)
+        return None
+```
+
+**Design rationale — do not remove these guards:**
+
+| Guard | Prevents |
+|---|---|
+| `arm_frames` + `max_drift` while arming | A hand passing through an O-like shape on its way somewhere else. |
+| `max_transition_s` | Making an O now and an OK sign a minute later reading as one gesture. |
+| `min_transition_s` | A single-frame landmark pop jumping straight from ZERO to OK_THREE. |
+| `confirm_frames` | One flickering frame of OK_THREE firing a skip. |
+| `max_drift` during the window | Reaching for something while your fingers happen to uncurl. |
+| `pose_grace_frames` | A dropped detection frame mid-transition killing a valid gesture. |
+| `release_frames` after cooldown | Holding the OK sign and re-firing forever. |
+| `last_reason` | You, at 1 am, wondering why it never fires. Put it on screen. |
+
+**Latency budget.** `arm_frames` (5) + `confirm_frames` (2) ≈ 7 frames. At 30 FPS that
+is ~0.23 s; at the 14 FPS a modest webcam actually delivers it is ~0.50 s. Frame counts
+scale with FPS — see 10.7. If the gesture feels sluggish, measure your FPS *first*.
+
 ### 4.5 L4 — the engine (orchestrator + debouncer)
 
 `src/spotify_skipper/gestures/engine.py`
@@ -1284,7 +1548,9 @@ from collections import deque
 import numpy as np
 
 from .. import features as F
-from .motion import GestureEvent, MotionConfig, MotionDetector, Sample, State
+# only what this module actually references — the detector is injected, so engine.py
+# never needs to import any concrete detector class
+from .motion import GestureEvent, Sample
 
 
 class GestureEngine:
@@ -1293,7 +1559,7 @@ class GestureEngine:
         """
         pose_fn : callable(canonical_landmarks) -> PoseResult
                   (rule-based `classify_pose` or the ML head from 4.6)
-        detector: MotionDetector | HoldDetector
+        detector: MotionDetector | HoldDetector | TransitionDetector
         """
         self.pose_fn = pose_fn
         self.detector = detector
@@ -1406,15 +1672,23 @@ Build this now; you will use it for the rest of the project.
 
 ```python
 # scripts/debug_engine.py
+import sys
+from pathlib import Path
+
+# Running this file directly puts scripts/ on sys.path, not the repo root,
+# so `src.` would not resolve. Prepend the repo root before importing it.
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
 import cv2
 from src.spotify_skipper.camera import Camera
 from src.spotify_skipper.hands import HandTracker
 from src.spotify_skipper.gestures.poses import classify_pose
-from src.spotify_skipper.gestures.motion import MotionConfig, MotionDetector
+from src.spotify_skipper.gestures.motion import TransitionConfig, TransitionDetector
 from src.spotify_skipper.gestures.engine import GestureEngine
 
-engine = GestureEngine(classify_pose, MotionDetector(MotionConfig()))
-tracker = HandTracker()
+engine = GestureEngine(classify_pose, TransitionDetector(TransitionConfig()))
+tracker = HandTracker(model_path=ROOT / "models" / "hand_landmarker.task")
 fired_at = 0.0
 with Camera() as cam:
     while True:
@@ -1443,10 +1717,13 @@ cv2.destroyAllWindows()
 
 Pass criteria for M4:
 
-- Holding an open palm still shows `state: ARMED`.
-- A deliberate swipe right flashes **SKIP** and prints an event.
-- A slow drift, a wave, and a diagonal reach do **not** fire — and `reason` tells you
-  which guard rejected each one.
+- Holding the **O** still shows `pose: ZERO` then `state: ARMED`.
+- Springing the three fingers up flashes **SKIP** and prints an event.
+- Holding the O indefinitely does **not** fire — arming is not firing.
+- Holding the finished OK sign does **not** re-fire; dropping it and re-forming the O
+  is what re-arms.
+- Opening a fist into an open palm, counting on your fingers, and an "OK" hand sign
+  made while talking do **not** fire — and `reason` tells you which guard rejected each.
 - Typing/idle shows `state: IDLE`, `pose: NONE`.
 
 ---
@@ -1480,7 +1757,7 @@ from .hands import HandTracker
 def main():
     ap = argparse.ArgumentParser(description="Record hand-landmark clips.")
     ap.add_argument("--label", required=True,
-                    help="clip label, e.g. skip_swipe / idle / decoy_wave")
+                    help="clip label, e.g. skip_transition / idle / decoy_ok_talking")
     ap.add_argument("--out", default="data/clips")
     ap.add_argument("--seconds", type=float, default=0.0,
                     help="auto-stop after N seconds (0 = manual stop with SPACE)")
@@ -1554,27 +1831,34 @@ if __name__ == "__main__":
 
 Run each command and record the specified clips.
 
-**Positives** — the gesture itself, ≥ 20 clips total:
+**Positives** — the gesture itself, ≥ 20 clips total. Record the *whole* thing: form
+the O, hold it a beat, then spring the three fingers up.
 
 ```bash
-python -m spotify_skipper.recorder --label skip_swipe
+python -m spotify_skipper.recorder --label skip_transition
 ```
 
 Vary deliberately: right hand and left hand; 40 cm / 80 cm / 120 cm from the camera;
-slow swipe and fast swipe; hand tilted ±30°; sitting upright and slouched; sleeves up
-and down; overhead light and lamp-only.
+snappy release and lazy release; hand tilted ±30°; sitting upright and slouched;
+sleeves up and down; overhead light and lamp-only.
 
-**Hard negatives** — things that must *never* fire, ≥ 15 clips:
+**Hard negatives** — things that must *never* fire, ≥ 15 clips. Note that these are
+**not** the swipe's decoys: waving and reaching are nearly irrelevant to a stationary
+pose transition, while hand shapes that pass near an O or an OK sign are the whole risk.
 
 ```bash
-python -m spotify_skipper.recorder --label decoy_wave        # waving hello
-python -m spotify_skipper.recorder --label decoy_reach        # reaching for a mug
+python -m spotify_skipper.recorder --label decoy_ok_talking   # "OK"/"got it" while talking
+python -m spotify_skipper.recorder --label decoy_hold_o       # form the O and just hold it
+python -m spotify_skipper.recorder --label decoy_fist_open    # fist opening into a flat hand
+python -m spotify_skipper.recorder --label decoy_count        # counting 1-2-3 on your fingers
+python -m spotify_skipper.recorder --label decoy_fidget       # fiddling, knuckle cracking
 python -m spotify_skipper.recorder --label decoy_type         # typing
-python -m spotify_skipper.recorder --label decoy_point        # pointing at the screen
-python -m spotify_skipper.recorder --label decoy_scratch      # scratching your face
+python -m spotify_skipper.recorder --label decoy_pinch        # pinch-zoom / picking something up
 python -m spotify_skipper.recorder --label decoy_talk         # talking with your hands
-python -m spotify_skipper.recorder --label decoy_stretch      # stretching arms
 ```
+
+`decoy_ok_talking` and `decoy_hold_o` are the two that matter. The first is the only
+natural gesture that reaches stage B; the second proves arming is not firing.
 
 **Idle soak** — long, boring, no gestures, ≥ 10 minutes total:
 
@@ -1604,7 +1888,7 @@ for k in sorted(c):
 EOF
 ```
 
-You want ≥ 20 `skip_swipe`, ≥ 15 decoys, ≥ 10 minutes of `idle`.
+You want ≥ 20 `skip_transition`, ≥ 15 decoys, ≥ 10 minutes of `idle`.
 
 ---
 
@@ -1705,8 +1989,20 @@ from sklearn.preprocessing import StandardScaler
 from . import features as F
 
 # Which frames of which clips carry which pose label.
-# The middle of a swipe clip is the trigger pose; decoys/idle are NONE.
-LABEL_MAP = {"skip_swipe": "OPEN_PALM"}
+#
+# CAUTION — this map is single-label-per-clip, which fitted the swipe (one pose held
+# throughout) and does NOT fit a transition (two poses, plus the change between them).
+# A `skip_transition` clip contains ZERO frames, OK_THREE frames, and ambiguous frames
+# in between; labelling all of them one way poisons the classifier.
+#
+# Two workable options:
+#   1. Record the two stages as SEPARATE clips for training purposes
+#      (`--label pose_zero`, `--label pose_ok_three`) and map those, leaving the
+#      full-gesture `skip_transition` clips for replay scoring only. Simplest — do this.
+#   2. Extend the recorder to write a per-frame label array and read it here.
+#
+# Option 1 is what the map below assumes. Decoys/idle are NONE.
+LABEL_MAP = {"pose_zero": "ZERO", "pose_ok_three": "OK_THREE"}
 DEFAULT_LABEL = "NONE"
 
 
@@ -1862,7 +2158,213 @@ def test_degenerate_hand_returns_none():
 > ~4e-7, extension ratios 1.000, feature length 52. If you change `features.py` and a
 > test fails, the feature extractor is wrong — not the test.
 
-`tests/test_motion.py` — the behavioural regression suite
+`tests/test_transition.py` — the behavioural regression suite for the **default**
+gesture. Pure pose sequences in, events out: no camera, no MediaPipe, no recorded data.
+
+```python
+"""Behavioural tests for the transition FSM, driven by synthetic pose sequences.
+
+The swipe suite below feeds trajectories; this one feeds POSE STREAMS at a constant
+position, because the gesture is a shape change in place. Where a position matters
+(the drift guard) it is passed explicitly.
+"""
+import numpy as np
+import pytest
+
+from src.spotify_skipper.gestures.motion import (Sample, TransitionConfig,
+                                                 TransitionDetector)
+
+FPS = 30.0
+DT = 1.0 / FPS
+SCALE = 0.12
+X0, Y0 = 0.5, 0.4
+
+A, B = "ZERO", "OK_THREE"
+
+
+def feed(poses, cfg=None, positions=None, conf=1.0):
+    """poses: list of pose names, or None for 'no hand this frame'."""
+    det = TransitionDetector(cfg or TransitionConfig())
+    fires = []
+    for i, pose in enumerate(poses):
+        t = i * DT
+        if pose is None:
+            sample = None
+        else:
+            pos = positions[i] if positions else (X0, Y0)
+            sample = Sample(t=t, center=np.array(pos, float), scale=SCALE,
+                            pose=pose, conf=conf)
+        if det.update(sample, t):
+            fires.append(round(t, 2))
+    return fires
+
+
+def hold(pose, n):
+    return [pose] * n
+
+
+# ---------------------------------------------------------------- must fire
+@pytest.mark.parametrize("name,seq", [
+    ("clean transition",      hold(A, 8) + hold(B, 10)),
+    ("long hold of the O",    hold(A, 60) + hold(B, 10)),
+    ("one dropped frame",     hold(A, 8) + [None] + hold(B, 10)),
+    ("two dropped frames",    hold(A, 8) + [None, None] + hold(B, 10)),
+])
+def test_deliberate_transitions_fire_exactly_once(name, seq):
+    assert len(feed(seq)) == 1, name
+
+
+# ------------------------------------------------------------ must not fire
+@pytest.mark.parametrize("name,seq", [
+    ("the O held forever",      hold(A, 120)),
+    ("OK sign, never an O",     hold(B, 120)),
+    ("O too brief to arm",      hold(A, 2) + hold(B, 20)),
+    ("gap longer than window",  hold(A, 8) + [None] * 30 + hold(B, 10)),
+    ("wrong stage B",           hold(A, 8) + hold("OPEN_PALM", 20)),
+    ("fist opening to a palm",  hold("FIST", 8) + hold("OPEN_PALM", 20)),
+    ("interrupted by a palm",   hold(A, 8) + hold("OPEN_PALM", 5) + hold(B, 10)),
+    ("fidgeting in and out",    (hold(A, 3) + [None] * 3) * 12),
+])
+def test_decoys_never_fire(name, seq):
+    assert feed(seq) == [], name
+
+
+def test_transition_while_the_hand_travels_is_rejected():
+    """Fingers uncurling while you reach for something is not the gesture."""
+    seq = hold(A, 8) + hold(B, 10)
+    pos = [(X0, Y0)] * 8 + [(X0 + 0.5 * SCALE * (k + 1), Y0) for k in range(10)]
+    assert feed(seq, positions=pos) == []
+
+
+def test_low_confidence_pose_never_arms():
+    assert feed(hold(A, 8) + hold(B, 10), conf=0.2) == []
+
+
+def test_holding_stage_b_never_refires():
+    """One sustained OK sign is one skip, not a stream of them."""
+    assert len(feed(hold(A, 8) + hold(B, 400))) == 1
+
+
+def test_must_return_to_the_o_to_fire_again():
+    """After the cooldown, stage B alone is not enough: the O must be re-formed."""
+    seq = hold(A, 8) + hold(B, 10) + [None] * 20 + hold(B, 200)
+    assert len(feed(seq)) == 1
+
+
+def test_repeats_after_cooldown_and_a_fresh_o():
+    seq = (hold(A, 8) + hold(B, 10) + [None] * 120
+           + hold(A, 8) + hold(B, 10) + [None] * 120)
+    assert len(feed(seq)) == 2
+
+
+def test_cooldown_collapses_a_rapid_repeat():
+    seq = hold(A, 8) + hold(B, 10) + [None] * 8 + hold(A, 8) + hold(B, 10)
+    assert len(feed(seq)) == 1
+
+
+def test_reason_explains_a_rejection():
+    det = TransitionDetector(TransitionConfig())
+    for i, pose in enumerate(hold(A, 8) + [None] * 30):
+        sample = None if pose is None else Sample(
+            t=i * DT, center=np.array([X0, Y0]), scale=SCALE, pose=pose, conf=1.0)
+        det.update(sample, i * DT)
+    assert "lost" in det.last_reason or "expired" in det.last_reason
+```
+
+`tests/test_hold.py` — the suite for `HoldDetector` (4.4.1).
+
+```python
+"""Behavioural tests for the hold FSM (4.4.1).
+
+The guide ships no suite for HoldDetector; this is it. Same shape as the transition
+suite: synthetic pose streams in, events out, no camera and no MediaPipe.
+"""
+import numpy as np
+import pytest
+
+from src.spotify_skipper.gestures.motion import HoldConfig, HoldDetector, Sample
+
+FPS = 30.0
+DT = 1.0 / FPS
+SCALE = 0.12
+X0, Y0 = 0.5, 0.4
+P = "PEACE"                       # HoldConfig.trigger_pose default
+HOLD_FRAMES = int(HoldConfig().hold_s * FPS)     # 36 at 30 FPS
+
+
+def feed(poses, cfg=None, positions=None, conf=1.0):
+    det = HoldDetector(cfg or HoldConfig())
+    fires = []
+    for i, pose in enumerate(poses):
+        t = i * DT
+        if pose is None:
+            sample = None
+        else:
+            pos = positions[i] if positions else (X0, Y0)
+            sample = Sample(t=t, center=np.array(pos, float), scale=SCALE,
+                            pose=pose, conf=conf)
+        if det.update(sample, t):
+            fires.append(round(t, 2))
+    return fires
+
+
+def hold(pose, n):
+    return [pose] * n
+
+
+def test_a_steady_hold_fires_exactly_once():
+    assert len(feed(hold(P, HOLD_FRAMES + 10))) == 1
+
+
+def test_a_hold_shorter_than_hold_s_never_fires():
+    assert feed(hold(P, HOLD_FRAMES - 5)) == []
+
+
+@pytest.mark.parametrize("name,seq", [
+    ("wrong pose",   hold("OPEN_PALM", 200)),
+    ("no hand",      [None] * 200),
+    ("pose flicker", (hold(P, 10) + [None]) * 15),
+])
+def test_decoys_never_fire(name, seq):
+    assert feed(seq) == [], name
+
+
+def test_low_confidence_never_fires():
+    assert feed(hold(P, 200), conf=0.2) == []
+
+
+def test_a_single_dropped_frame_restarts_the_clock():
+    """HoldDetector has no pose_grace_frames — unlike TransitionDetector, one lost
+    frame costs you the whole hold. Documented here so it is a choice, not a surprise."""
+    seq = hold(P, 20) + [None] + hold(P, 20)
+    assert feed(seq) == []
+
+
+def test_drifting_past_max_drift_restarts_the_clock():
+    seq = hold(P, 200)
+    pos = [(X0 + 0.20 * SCALE * k, Y0) for k in range(200)]
+    assert feed(seq, positions=pos) == []
+
+
+def test_small_wander_inside_max_drift_still_fires():
+    n = HOLD_FRAMES + 10
+    seq = hold(P, n)
+    pos = [(X0 + 0.30 * SCALE * np.sin(0.3 * k), Y0) for k in range(n)]
+    assert len(feed(seq, positions=pos)) == 1
+
+
+def test_holding_continuously_never_refires():
+    """One long hold is one skip, not a stream — the release gate must block re-arming."""
+    assert len(feed(hold(P, 400))) == 1
+
+
+def test_repeats_after_cooldown_and_a_fresh_hold():
+    seq = hold(P, HOLD_FRAMES + 10) + [None] * 150 + hold(P, HOLD_FRAMES + 10)
+    assert len(feed(seq)) == 2
+```
+
+`tests/test_motion.py` — the swipe suite. Only needed if you set `type = "motion"` and
+write `MotionDetector`; it is the reference for how a *travel*-based detector is tested.
 
 ```python
 """Behavioural tests for the gesture FSM, driven by synthetic hand trajectories.
@@ -1982,16 +2484,19 @@ def test_disabling_confirmation_reintroduces_wave_triggering():
     assert feed(waving(1.0, 2.0), MotionConfig(confirm_s=0.0)) != []
 ```
 
-> This suite is the reason the FSM in 4.4 looks the way it does. Every guard in it was
-> added in response to a decoy in this file that fired when it should not have. Run it
-> after **any** change to `motion.py` or to the `[gesture]` section of `config.toml`:
-> it takes 0.2 s and no webcam.
+> These suites are the reason the FSMs in 4.4 look the way they do. Every guard was
+> added in response to a decoy that fired when it should not have. Run them after
+> **any** change to `motion.py` or to the `[gesture]` section of `config.toml`:
+> they take under a second and need no webcam.
 
 ```bash
 pip install pytest && python -m pytest tests -q
 ```
 
-Expected: **27 passed** (6 feature tests + 21 motion tests).
+Expected: **57 passed** (6 feature + 21 motion + 19 transition + 11 hold).
+
+If you have not written `MotionDetector` yet, `tests/test_motion.py` will not import.
+Expect **36 passed** (6 feature + 19 transition + 11 hold) until you do.
 
 ### 6.4 Checkpoint M6
 
@@ -2001,12 +2506,15 @@ python -m spotify_skipper.replay --verbose
 
 Targets before you go anywhere near the Spotify API:
 
-- `recall ≥ 90 %` on `skip_swipe` clips,
+- `recall ≥ 90 %` on `skip_transition` clips,
 - `FP = 0` on decoys,
 - `idle FP rate = 0.00 per hour`.
 
-If recall is low, loosen `travel_hand_widths` or `arm_frames`. If FP > 0, look at which
-clip fired (`--verbose` prints it) and tighten the specific guard that let it through.
+If recall is low, loosen `max_transition_s` (the release may be slower than 0.6 s) or
+drop `arm_frames`; if `ZERO` never appears at all the problem is upstream in `poses.py`,
+not here. If FP > 0, look at which clip fired (`--verbose` prints it) and tighten the
+specific guard that let it through — for `decoy_ok_talking` that is `arm_frames` and
+`max_drift`; for `decoy_fist_open` it is the `poses.py` thresholds.
 **Always change one value at a time and re-run.** This loop takes seconds; the
 webcam loop takes minutes.
 
@@ -2251,24 +2759,35 @@ max_hand_scale = 0.60                        # ...and implausibly large ones
 
 # ---------------------------------------------------------------- gesture (L3/L4)
 [gesture]
-type                = "motion"     # motion | hold
+type                = "transition"   # transition | motion | hold
+cooldown_s          = 3.0
+release_frames      = 5
+
+# --- used when type = "transition" (the default gesture; see 4.4.2) ---
+stage_a_pose        = "ZERO"       # the "O" — arms the gesture
+stage_b_pose        = "OK_THREE"   # three fingers up — fires it
+arm_frames          = 5            # consecutive stage-A frames needed to arm
+max_transition_s    = 0.60         # B must arrive within this of leaving A
+min_transition_s    = 0.05
+confirm_frames      = 2
+max_drift           = 0.80         # hand-widths the hand may wander, A -> B
+min_conf            = 0.50
+pose_grace_frames   = 2
+
+# --- used only when type = "motion" (the swipe; see 4.4) ---
 trigger_pose        = "OPEN_PALM"
 direction           = "right"
-arm_frames          = 6
 arm_stillness       = 0.55
 travel_hand_widths  = 1.6
 min_duration_s      = 0.10
 max_duration_s      = 0.70
 lateral_ratio       = 0.60
 monotonic_ratio     = 0.80
-pose_grace_frames   = 3
 confirm_s           = 0.40    # wave rejection window; see 4.4. 0 disables it
 reversal_ratio      = 0.50    # cancel if the hand returns this fraction of the way back
-cooldown_s          = 3.0
-release_frames      = 5
-# used only when type = "hold"
+
+# --- used only when type = "hold" (see 4.4.1) ---
 hold_s              = 1.2
-max_drift           = 0.9
 
 # ---------------------------------------------------------------- action
 [spotify]
@@ -2326,7 +2845,23 @@ def build_pose_fn(cfg: Config):
 
 def build_detector(cfg: Config):
     g = cfg.section("gesture")
-    if g.get("type", "motion") == "hold":
+    kind = g.get("type", "transition")
+    if kind == "transition":
+        from .gestures.motion import TransitionConfig, TransitionDetector
+        return TransitionDetector(TransitionConfig(
+            stage_a_pose=g.get("stage_a_pose", "ZERO"),
+            stage_b_pose=g.get("stage_b_pose", "OK_THREE"),
+            arm_frames=int(g.get("arm_frames", 5)),
+            max_transition_s=float(g.get("max_transition_s", 0.60)),
+            min_transition_s=float(g.get("min_transition_s", 0.05)),
+            confirm_frames=int(g.get("confirm_frames", 2)),
+            max_drift=float(g.get("max_drift", 0.80)),
+            min_conf=float(g.get("min_conf", 0.50)),
+            pose_grace_frames=int(g.get("pose_grace_frames", 2)),
+            cooldown_s=float(g.get("cooldown_s", 3.0)),
+            release_frames=int(g.get("release_frames", 5)),
+        ))
+    if kind == "hold":
         from .gestures.motion import HoldConfig, HoldDetector
         return HoldDetector(HoldConfig(
             trigger_pose=g.get("trigger_pose", "PEACE"),
@@ -2339,7 +2874,7 @@ def build_detector(cfg: Config):
     return MotionDetector(MotionConfig(
         trigger_pose=g.get("trigger_pose", "OPEN_PALM"),
         direction=g.get("direction", "right"),
-        arm_frames=int(g.get("arm_frames", 6)),
+        arm_frames=int(g.get("arm_frames", 6)),   # NOTE: motion default, not 5
         arm_stillness=float(g.get("arm_stillness", 0.55)),
         travel_hand_widths=float(g.get("travel_hand_widths", 1.6)),
         min_duration_s=float(g.get("min_duration_s", 0.10)),
@@ -2461,8 +2996,9 @@ def run(config_path="config.toml", dry_run=False, preview=None, test_skip=False)
                 obs = tracker.process(fr.image, fr.timestamp_ms)
 
                 for ev in engine.process(obs, w, h):
-                    log.info("gesture %s travel=%.2fhw dur=%.2fs",
-                             ev.name, ev.travel_hand_widths, ev.duration_s)
+                    # travel is always 0.0 for transition/hold gestures
+                    log.info("gesture %s dur=%.2fs travel=%.2fhw",
+                             ev.name, ev.duration_s, ev.travel_hand_widths)
                     if app_cfg.get("beep", True):
                         print("\a", end="", flush=True)
                     action()
@@ -2577,39 +3113,58 @@ Never tune against the live camera; you cannot reproduce the exact motion twice.
 
 ### 9.2 Symptom → knob table
 
+**Default gesture (`type = "transition"`):**
+
+| Symptom | Knob | Direction |
+|---|---|---|
+| `state` never reaches `ARMED`; `pose` never shows `ZERO` | the O rules are wrong for your hand — re-run `calibrate_pose.py`, raise `CIRCLE_MAX`, lower `ZERO_INDEX_MIN` |
+| Arms, but `reason: transition window expired` | `max_transition_s` | ↑ to 0.9 — your release is slower than you think |
+| Arms, but `reason: drifted … during the transition` | `max_drift` ↑ 1.2, or keep your hand still while releasing |
+| Arms, but `reason: pose … interrupted the transition` | the poses collide — a frame is classifying as `OPEN_PALM`/`FIST` mid-release. Tighten `EXT_OPEN`/`EXT_CURL` so the intermediate shape falls to `NONE`, which `pose_grace_frames` absorbs |
+| Fires on an "OK" hand sign while talking | `arm_frames` ↑ 8, `max_drift` ↓ 0.5 | |
+| Fires when opening a fist | `poses.py`: `ZERO` is matching a fist. Raise `ZERO_INDEX_MIN` | |
+| Fires twice per gesture | `cooldown_s` ↑, `release_frames` ↑ | |
+| Second skip in a row is ignored | expected: `cooldown_s` (3 s) **plus** re-forming the O. Allow ~4 s between skips | |
+| Feels sluggish | check FPS first — `arm_frames` + `confirm_frames` are *frames*, so at 14 FPS they cost twice the wall-clock they do at 30. Then `arm_frames` ↓ 4 |
+| Random single-frame fires | `confirm_frames` ↑ 3, `smoothing_frames` ↑ 5 | |
+| Fires when someone walks past | `min_hand_scale` ↑, `num_hands = 1` | |
+| Works close, not far | you broke scale invariance — check `to_iso`/`hand_scale`; distances must be divided by `scale` |
+| Works with right hand only | handedness mirroring in `canonicalize` is not applied — check the `Left` branch |
+
+**Swipe alternative (`type = "motion"`):**
+
 | Symptom | Knob | Direction |
 |---|---|---|
 | Won't fire; `reason: travel X < 1.6` | `travel_hand_widths` | ↓ to 1.2–1.4 |
 | Won't fire; `reason: window expired` | `max_duration_s` | ↑ to 0.9 |
-| Won't fire; `state` never reaches `ARMED` | `arm_frames` ↓ 4, `arm_stillness` ↑ 0.8, or pose thresholds in `poses.py` are too strict — re-run `calibrate_pose.py` |
+| Won't fire; `state` never reaches `ARMED` | `arm_frames` ↓ 4, `arm_stillness` ↑ 0.8 |
 | Fires when you reach for something | `lateral_ratio` ↓ 0.4, `arm_frames` ↑ 8 | |
 | Fires while waving | `confirm_s` ↑ 0.50, `reversal_ratio` ↓ 0.35 | |
 | Detects the swipe but never fires (`reason: reversed…`) | you are snapping your hand back — hold the end position, or `confirm_s` ↓ 0.30 | |
-| Second skip in a row is ignored | expected: `cooldown_s` (3 s) **plus** the re-arm. Allow ~4 s between skips, or drop your hand between them | |
-| Fires twice per swipe | `cooldown_s` ↑, `release_frames` ↑ | |
-| Fires when someone walks past | `min_hand_scale` ↑, `num_hands = 1` | |
-| Random single-frame fires | `smoothing_frames` ↑ 5, `min_duration_s` ↑ 0.15 | |
-| Works close, not far | you broke scale invariance — check `to_iso`/`hand_scale`; distances must be divided by `scale` |
-| Works with right hand only | handedness mirroring in `canonicalize` is not applied — check the `Left` branch |
 
 ### 9.3 Raise the bar deliberately
 
 If you want the gesture to be *essentially impossible* to trigger by accident, layer a
 second condition rather than tightening one to an extreme:
 
-- **Two-stage gesture**: `HoldDetector` for 0.4 s *then* a swipe. Chain them by feeding
-  the swipe detector only while the hold detector is satisfied.
+- **The default gesture is already this.** A two-pose transition through a closed
+  thumb-index loop is a layered condition: two rare shapes *and* an ordering *and* a
+  time limit *and* a stillness constraint. That is why it needs none of the swipe's
+  wave-rejection machinery.
 - **Region gating**: require the palm centre to be in the upper half of the frame
-  (`center[1] < 0.5`) — nobody swipes at face height by accident.
-- **Rare pose**: use a pose you never make while working (e.g. index+pinky "rock horns")
-  as `trigger_pose`. Rule it in `poses.py` with the calibration procedure from 4.3.
+  (`center[1] < 0.5`) — nobody gestures at face height by accident.
+- **Rarer stage A**: if `ZERO` proves too close to your resting hand, swap it for
+  index+pinky "rock horns" — a shape you never make while working. Rule it in
+  `poses.py` with the calibration procedure from 4.3 and set `stage_a_pose`.
+- **Longer arm**: `arm_frames` ↑ 10 forces a deliberate, held O rather than a shape
+  your hand passes through.
 
 ### 9.4 Checkpoint M9
 
 ```bash
 python -m spotify_skipper --dry-run --no-preview &
 # work normally for 10 minutes, then:
-grep -c "DRY-RUN" logs/skipper.log        # must be exactly the number of deliberate swipes
+grep -c "DRY-RUN" logs/skipper.log        # must equal the number of deliberate gestures
 ```
 
 Then re-run the full offline suite and record the numbers in `README.md` so a future
@@ -2746,15 +3301,15 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 | Difference | Effect | Action |
 |---|---|---|
-| Different webcam, different FOV | your hand occupies a different fraction of frame | re-check `travel_hand_widths`; it is in hand-widths so it *should* transfer, but verify |
-| Lower/higher FPS | frame-count thresholds shift in time | if Windows runs at 15 FPS, halve `arm_frames`, `pose_grace_frames`, `release_frames` |
+| Different webcam, different FOV | your hand occupies a different fraction of frame | pose thresholds are ratios and should transfer; re-run `calibrate_pose.py` to confirm `circle_gap` still separates |
+| Lower/higher FPS | frame-count thresholds shift in time | if Windows runs at 15 FPS, halve `arm_frames`, `confirm_frames`, `pose_grace_frames`, `release_frames` — this matters more for the transition gesture than the swipe, because its whole latency budget is frame counts |
 | DirectShow ignores `CAP_PROP_BUFFERSIZE` | ~1 extra frame of latency | harmless |
 | Camera index 0 is a virtual cam (OBS, Windows Hello IR) | wrong or black video | try `device = 1`, `2` in `config.toml` |
 | Windows Defender scans the venv on first run | first launch is slow | expected; subsequent runs are fast |
 
 ### 10.8 Checkpoint M11
 
-On Windows: `--dry-run` shows the HUD at ≥ 15 FPS, your swipe flashes the frame, and
+On Windows: `--dry-run` shows the HUD at ≥ 15 FPS, your gesture flashes the frame, and
 `logs\skipper.log` records the event. Then a real run actually skips a track.
 
 ---
@@ -2915,7 +3470,7 @@ If the token cache ever leaks, revoke access at
 |---|---|---|
 | 1 | Perform the gesture with music playing | track advances within ~1 s |
 | 2 | Perform it twice in 1 s | exactly one skip (cooldown) |
-| 3 | Wave, reach, type for 10 min | zero skips |
+| 3 | Type, gesture while talking, make an "OK" sign, open a fist, for 10 min | zero skips |
 | 4 | Pause Spotify entirely, then gesture | log warns `no active device`, app keeps running |
 | 5 | Unplug the network, then gesture | log warns `network error`, app keeps running |
 | 6 | Cover the camera, then uncover | recovers, no crash |
@@ -2992,8 +3547,10 @@ distance (Phase 4.2), never as raw y-coordinates.
 | Symptom | Where to look |
 |---|---|
 | Never arms | `engine.debug["pose"]` — if always `NONE`, the pose rules are wrong for your hand; re-run `calibrate_pose.py` |
-| Arms then immediately drops | `arm_stillness` too low, or `smoothing_frames` too high for your FPS |
-| Fires on hand entry | increase `arm_frames`; entry motion is being read as travel |
+| Arms then immediately drops | `max_drift` too low, or `smoothing_frames` too high for your FPS |
+| Arms but never fires | `engine.debug["reason"]` names the guard: window expired, drifted, or a pose interrupted the release |
+| Transition never completes | the intermediate hand shape is classifying as a *named* pose rather than `NONE`; `pose_grace_frames` only absorbs `NONE` |
+| Fires on hand entry (swipe only) | increase `arm_frames`; entry motion is being read as travel |
 | Behaviour differs between machines | FPS differs — everything measured in *frames* scales with FPS; prefer seconds-based thresholds if you see this a lot |
 
 ### Spotify
@@ -3177,6 +3734,8 @@ If handing this to another Claude Code session, this is the executable summary:
 8.  write gestures/engine.py              (4.5)
 9.  write config.toml (8.1) + config.py (8.2)     [needed by replay.py]
 10. write recorder.py (5.1) ; STOP -> the human must record clips (5.2)
+    NOTE: the default gesture is a POSE TRANSITION (ZERO -> OK_THREE), not a swipe.
+    Positives are `skip_transition`; decoys are OK-signs/fist-opens, not waves.
 11. write replay.py (6.1) + tests (6.3)  -> iterate thresholds until 6.4 passes
 12. (optional) classifier.py (4.6) + train.py (6.2)
 13. write actions/spotify.py (7.3) + auth.py (7.4) ; STOP -> the human must
@@ -3198,6 +3757,9 @@ else is scriptable.
 3. All spatial thresholds are expressed in **hand-widths**, never pixels (Phase 4.2).
 4. Pose classification never triggers an action directly — L3 and L4 always sit between
    (Phase 4.1).
+4b. Arming is not firing. `TransitionDetector` reaching `ARMED` on stage A must never
+   emit an event; only the stage-A → stage-B change does, and only once per cooldown
+   plus a return to stage A (Phase 4.4.2).
 5. Exactly one Spotify request per accepted gesture; failures are logged, never retried
    in a loop (Phase 7.3).
 6. No frames, images, or landmarks are ever transmitted (Phase 12).
